@@ -1,38 +1,59 @@
+# main.py — ZachFit backend (Stripe webhooks -> Jarvas memory)
+# Python 3.11+ recommended
+
 import os
 import json
+import logging
 from datetime import datetime
+from typing import Any, Optional, Dict, List, Tuple
 
-from fastapi import FastAPI, Request, HTTPException
 import stripe
 import requests
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 
-# -----------------------------
-# FastAPI app
-# -----------------------------
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("zachfit-backend")
+
+# ------------------------------------------------------------
+# App
+# ------------------------------------------------------------
 app = FastAPI()
 
-# -----------------------------
-# Stripe config
-# -----------------------------
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-# Price IDs (from Stripe dashboard env vars)
+# ------------------------------------------------------------
+# ENV
+# ------------------------------------------------------------
+# Stripe
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 STRIPE_LITE_PRICE_ID = os.getenv("STRIPE_LITE_PRICE_ID")
 STRIPE_STANDARD_PRICE_ID = os.getenv("STRIPE_STANDARD_PRICE_ID")
 
-# -----------------------------
-# Jarvas config
-# -----------------------------
-JARVAS_BASE_URL = os.getenv(
-    "JARVAS_BASE_URL",
-    "https://jarvas-memory-api.onrender.com",
-)
+# Jarvas (Redis-backed memory API)
+JARVAS_BASE_URL = os.getenv("JARVAS_BASE_URL", "https://jarvas-memory-api-1.onrender.com").rstrip("/")
 JARVAS_USER_ID = os.getenv("JARVAS_USER_ID", "zach")
-JARVAS_API_KEY = os.getenv("JARVAS_API_KEY")
+JARVAS_API_KEY = os.getenv("JARVAS_API_KEY")  # should equal MEMORY_API_KEY on Jarvas service
+
+# Safety mode: if Jarvas is unavailable, we return 500 so Stripe retries.
+FAIL_CLOSED = os.getenv("FAIL_CLOSED", "true").lower() in ("1", "true", "yes", "y")
+
+# Wire Stripe SDK
+stripe.api_key = STRIPE_SECRET_KEY
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def iso_now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def _slugify_name(name: str | None) -> str:
+def slugify_name(name: Optional[str]) -> str:
     if not name:
         return "client"
     return (
@@ -44,234 +65,414 @@ def _slugify_name(name: str | None) -> str:
     )
 
 
-def _iso_now() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+# ------------------------------------------------------------
+# Jarvas Client (JSON-safe, fail-closed)
+# ------------------------------------------------------------
+class JarvasUnavailable(RuntimeError):
+    """Raised when Jarvas memory store can't be reached or returns non-2xx."""
 
 
-# -----------------------------
-# Jarvas helpers
-# -----------------------------
-def fetch_training_clients() -> list[dict]:
+def jarvas_headers() -> dict:
+    h: dict = {"content-type": "application/json"}
+    if JARVAS_API_KEY:
+        h["x-api-key"] = JARVAS_API_KEY
+    return h
+
+
+def _maybe_parse_json_string(v: Any) -> Any:
     """
-    Get the current training_clients array from Jarvas memory.
-    Returns [] if not found or if anything looks broken.
+    Jarvas may return:
+      - list/dict (new JSON-safe Jarvas)
+      - string "..." (older values)
+    If it's a JSON-looking string, parse it.
     """
+    if not isinstance(v, str):
+        return v
+
+    s = v.strip()
+    if not s:
+        return v
+
+    # quick heuristic
+    if s[0] in "[{\"" or s in ("null", "true", "false") or s.replace(".", "", 1).isdigit():
+        try:
+            return json.loads(s)
+        except Exception:
+            return v
+    return v
+
+
+def jarvas_get_all(user_id: str = JARVAS_USER_ID) -> Dict[str, Any]:
+    """
+    Returns dict of memory {key: value}.
+    Raises JarvasUnavailable on any error (so we don't accidentally wipe by overwriting with []).
+    """
+    if not JARVAS_API_KEY:
+        raise JarvasUnavailable("JARVAS_API_KEY missing")
+
     try:
-        headers = {}
-        if JARVAS_API_KEY:
-            headers["x-api-key"] = JARVAS_API_KEY
-
-        resp = requests.get(
+        r = requests.get(
             f"{JARVAS_BASE_URL}/get_memory",
-            params={"user_id": JARVAS_USER_ID},
-            headers=headers,
-            timeout=5,
+            params={"user_id": user_id},
+            headers=jarvas_headers(),
+            timeout=10,
         )
-        resp.raise_for_status()
-        data = resp.json()
+        r.raise_for_status()
+        data = r.json()
+        out: Dict[str, Any] = {}
+        for mem in data.get("memories", []):
+            k = mem.get("key")
+            v = mem.get("value")
+            if k:
+                out[k] = _maybe_parse_json_string(v)
+        return out
     except Exception as e:
-        print("Error calling get_memory:", e)
-        return []
+        raise JarvasUnavailable(f"Jarvas get_memory failed: {e!r}") from e
 
-    memories = data.get("memories", [])
-    for mem in memories:
-        if mem.get("key") == "training_clients":
-            raw = mem.get("value", "[]")
-            try:
-                arr = json.loads(raw)
-                if isinstance(arr, list):
-                    return arr
-            except Exception as e:
-                print("Error parsing training_clients JSON:", e)
-                return []
+
+def jarvas_get_key(key: str, default: Any = None, user_id: str = JARVAS_USER_ID) -> Any:
+    store = jarvas_get_all(user_id=user_id)
+    return store.get(key, default)
+
+
+def jarvas_set_key(key: str, value: Any, user_id: str = JARVAS_USER_ID) -> None:
+    if not JARVAS_API_KEY:
+        raise JarvasUnavailable("JARVAS_API_KEY missing")
+
+    payload = {"user_id": user_id, "key": key, "value": value}
+    try:
+        r = requests.post(
+            f"{JARVAS_BASE_URL}/save_memory",
+            json=payload,
+            headers=jarvas_headers(),
+            timeout=10,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        raise JarvasUnavailable(f"Jarvas save_memory failed: {e!r}") from e
+
+
+def coerce_list_of_dicts(v: Any) -> List[dict]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [x for x in v if isinstance(x, dict)]
+    if isinstance(v, str):
+        parsed = _maybe_parse_json_string(v)
+        if isinstance(parsed, list):
+            return [x for x in parsed if isinstance(x, dict)]
     return []
 
 
-def save_training_clients(clients: list[dict]) -> None:
-    """
-    Save the full training_clients array back into Jarvas.
-    """
-    payload = {
-        "user_id": JARVAS_USER_ID,
-        "key": "training_clients",
-        "value": json.dumps(clients),
-    }
-
-    headers = {}
-    if JARVAS_API_KEY:
-        headers["x-api-key"] = JARVAS_API_KEY
-
-    try:
-        resp = requests.post(
-            f"{JARVAS_BASE_URL}/save_memory",
-            json=payload,
-            headers=headers,
-            timeout=5,
-        )
-        resp.raise_for_status()
-        print("Saved training_clients to Jarvas. Status:", resp.status_code)
-    except Exception as e:
-        print("Error saving training_clients:", e)
-
-
-def infer_tier_from_price(price_id: str | None) -> str:
-    """
-    Map Stripe price ID -> coaching_tier label.
-    """
+# ------------------------------------------------------------
+# Stripe helpers
+# ------------------------------------------------------------
+def infer_tier_from_price(price_id: Optional[str]) -> str:
     if not price_id:
         return "unknown"
-
     if STRIPE_LITE_PRICE_ID and price_id == STRIPE_LITE_PRICE_ID:
         return "ai_only"
-
     if STRIPE_STANDARD_PRICE_ID and price_id == STRIPE_STANDARD_PRICE_ID:
         return "standard"
-
     return "unknown"
 
 
-def update_training_client_from_stripe(
-    customer_email: str | None,
-    customer_name: str | None,
-    price_id: str | None,
-    status: str,
+def get_customer_email_name(
+    customer_id: Optional[str],
+    fallback_email: Optional[str],
+    fallback_name: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Stripe events are inconsistent: best source is Customer.retrieve(customer_id)
+    """
+    email = fallback_email
+    name = fallback_name
+
+    if customer_id:
+        try:
+            cust = stripe.Customer.retrieve(customer_id)
+            email = cust.get("email") or email
+            name = cust.get("name") or name
+        except Exception as e:
+            log.warning("Stripe Customer.retrieve failed: %r", e)
+
+    if email:
+        email = email.strip().lower()
+
+    return email, name
+
+
+def get_price_id_from_subscription(subscription_id: Optional[str]) -> Optional[str]:
+    if not subscription_id:
+        return None
+    try:
+        sub = stripe.Subscription.retrieve(subscription_id, expand=["items.data.price"])
+        items = (sub.get("items") or {}).get("data") or []
+        if items:
+            price = items[0].get("price") or {}
+            return price.get("id")
+    except Exception as e:
+        log.warning("Stripe Subscription.retrieve failed: %r", e)
+    return None
+
+
+def get_price_id_from_checkout_session(session_obj: dict) -> Optional[str]:
+    # Preferred: subscription -> price
+    sub_id = session_obj.get("subscription")
+    if isinstance(sub_id, str) and sub_id:
+        pid = get_price_id_from_subscription(sub_id)
+        if pid:
+            return pid
+
+    # fallback: retrieve session expanded line_items
+    try:
+        sess_id = session_obj.get("id")
+        if not sess_id:
+            return None
+        sess = stripe.checkout.Session.retrieve(sess_id, expand=["line_items.data.price"])
+        line_items = (sess.get("line_items") or {}).get("data") or []
+        if line_items:
+            price = line_items[0].get("price") or {}
+            return price.get("id")
+    except Exception as e:
+        log.warning("Stripe Session.retrieve(line_items) failed: %r", e)
+
+    return None
+
+
+# ------------------------------------------------------------
+# Idempotency marker (stored in Jarvas)
+# ------------------------------------------------------------
+def already_processed_event(event_id: str) -> bool:
+    marker_key = f"stripe_event:{event_id}"
+    try:
+        v = jarvas_get_key(marker_key, default=None)
+        return v is not None
+    except JarvasUnavailable:
+        # If jarvas is down we *can't* confirm. We'll fail closed later anyway.
+        return False
+
+
+def mark_event_processed(event_id: str) -> None:
+    marker_key = f"stripe_event:{event_id}"
+    jarvas_set_key(marker_key, {"processed_at": iso_now()})
+
+
+# ------------------------------------------------------------
+# training_clients upsert (no-wipe safe)
+# ------------------------------------------------------------
+def upsert_training_client(
+    *,
+    email: Optional[str],
+    name: Optional[str],
+    price_id: Optional[str],
+    billing_status: str,
+    source: str,
 ) -> None:
-    """
-    Upsert a client into training_clients based on Stripe subscription/checkout.
-    """
-    if not customer_email:
-        print("No customer_email; skipping training_clients update.")
+    if not email:
+        log.info("No email; skipping training_clients upsert.")
         return
 
     coaching_tier = infer_tier_from_price(price_id)
-    clients = fetch_training_clients()
-    email_lower = customer_email.lower()
+    store = jarvas_get_all()
+    clients = coerce_list_of_dicts(store.get("training_clients"))
 
-    # Try to find existing client by email
+    now = iso_now()
+    year = datetime.utcnow().year
+
     existing = None
     for c in clients:
-        if c.get("email", "").lower() == email_lower:
+        if (c.get("email") or "").strip().lower() == email:
             existing = c
             break
 
     if existing:
-        print("Updating existing training client from Stripe:", customer_email)
-        existing["name"] = existing.get("name") or customer_name
-        existing["email"] = customer_email
-        existing["coaching_tier"] = coaching_tier
-        existing["billing_status"] = status
-        existing["billing_last_updated"] = _iso_now()
-        existing.setdefault("source", "stripe")
+        existing["email"] = email
+        existing["name"] = existing.get("name") or name
+        if coaching_tier != "unknown":
+            existing["coaching_tier"] = coaching_tier
+        existing["billing_status"] = billing_status or existing.get("billing_status", "unknown")
+        existing["status"] = existing.get("status") or "active"
+        existing["billing_last_updated"] = now
+        existing["updated_at"] = now
+        existing["source"] = existing.get("source") or source
     else:
-        print("Creating new training client from Stripe:", customer_email)
-        slug = _slugify_name(customer_name or customer_email)
-        year = datetime.utcnow().year
+        slug = slugify_name(name or email)
         new_client = {
             "id": f"train_{slug}_{year}",
-            "name": customer_name,
-            "email": customer_email,
+            "name": name,
+            "phone": None,
+            "email": email,
             "status": "active",
             "coaching_tier": coaching_tier,
-            "billing_status": status,
-            "billing_last_updated": _iso_now(),
-            "source": "stripe",
+            "billing_status": billing_status,
+            "goals": "",
+            "notes": "",
+            "training_profile": {
+                "experience_level": "unknown",
+                "days_per_week": None,
+                "preferred_split": None,
+                "constraints": [],
+                "equipment": "unknown",
+            },
+            "program_current": None,
+            "program_history": [],
+            "last_checkin": None,
+            "checkin_history": [],
+            "billing": None,
+            "billing_last_updated": now,
+            "source": source,
+            "created_at": now,
+            "updated_at": now,
         }
         clients.append(new_client)
 
-    save_training_clients(clients)
+    # Save the full list back (Jarvas stores JSON safely)
+    jarvas_set_key("training_clients", clients)
 
 
-# -----------------------------
-# FastAPI routes
-# -----------------------------
+# ------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "zachfit-backend"}
+    return {"status": "ok", "service": "zachfit-backend", "time": iso_now()}
+
+
+@app.get("/healthz")
+async def healthz():
+    """
+    Health check verifies:
+      - Stripe key configured (not secret validity)
+      - Jarvas reachable (optional, but recommended)
+    """
+    ok = True
+    details: Dict[str, Any] = {"time": iso_now()}
+
+    details["stripe_configured"] = bool(STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET)
+
+    # Jarvas check
+    try:
+        _ = jarvas_get_all()
+        details["jarvas"] = "ok"
+    except Exception as e:
+        details["jarvas"] = f"unavailable: {e!r}"
+        ok = False
+
+    return JSONResponse(status_code=200 if ok else 503, content={"ok": ok, **details})
 
 
 @app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
-    """
-    Endpoint Stripe calls for subscription / checkout events.
-    """
+    # Basic env validation
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not configured")
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET not configured")
+
     payload = await request.body()
     sig_header = request.headers.get("Stripe-Signature")
-
-    if not WEBHOOK_SECRET:
-        raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
     try:
         event = stripe.Webhook.construct_event(
             payload=payload,
             sig_header=sig_header,
-            secret=WEBHOOK_SECRET,
+            secret=STRIPE_WEBHOOK_SECRET,
         )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid payload")
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    event_type = event["type"]
-    obj = event["data"]["object"]
+    event_id = event.get("id") or ""
+    event_type = event.get("type")
+    obj: dict = event["data"]["object"]
 
-    print("Received Stripe event:", event_type)
+    log.info("Stripe event received: type=%s id=%s", event_type, event_id)
 
-    # ------ checkout.session.completed ------
-    if event_type == "checkout.session.completed":
-        customer_email = (
-            obj.get("customer_details", {}) or {}
-        ).get("email") or obj.get("customer_email")
-        customer_name = (
-            obj.get("customer_details", {}) or {}
-        ).get("name")
+    # Idempotency check (best effort)
+    try:
+        if event_id and already_processed_event(event_id):
+            log.info("Stripe event already processed, skipping: %s", event_id)
+            return {"received": True, "skipped": True}
+    except Exception as e:
+        log.warning("Idempotency check failed: %r", e)
+        # continue; fail-closed later if needed
 
-        # Try to pull a price_id from the session
-        price_id = None
-        subscription = obj.get("subscription")
-        if isinstance(subscription, dict):
-            # In some webhook types you might get expanded subscription
-            items = subscription.get("items", {}).get("data", [])
+    # Process
+    try:
+        if event_type == "checkout.session.completed":
+            customer_id = obj.get("customer")
+            details = obj.get("customer_details") or {}
+            fallback_email = details.get("email") or obj.get("customer_email")
+            fallback_name = details.get("name")
+
+            email, name = get_customer_email_name(customer_id, fallback_email, fallback_name)
+            price_id = get_price_id_from_checkout_session(obj)
+
+            upsert_training_client(
+                email=email,
+                name=name,
+                price_id=price_id,
+                billing_status="active",
+                source="stripe_checkout",
+            )
+
+        elif event_type in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
+            customer_id = obj.get("customer")
+            email, name = get_customer_email_name(customer_id, None, None)
+
+            items = (obj.get("items") or {}).get("data") or []
+            price_id = None
             if items:
-                price_id = items[0].get("price", {}).get("id")
-        elif isinstance(subscription, str):
-            try:
-                sub = stripe.Subscription.retrieve(subscription)
-                items = sub.get("items", {}).get("data", [])
-                if items:
-                    price_id = items[0].get("price", {}).get("id")
-            except Exception as e:
-                print("Error retrieving subscription:", e)
+                price_id = ((items[0].get("price") or {}).get("id"))
 
-        update_training_client_from_stripe(
-            customer_email=customer_email,
-            customer_name=customer_name,
-            price_id=price_id,
-            status="active",
-        )
+            billing_status = obj.get("status") or ("canceled" if event_type.endswith("deleted") else "unknown")
 
-    # ------ subscription / billing updates ------
-    elif event_type in (
-        "customer.subscription.updated",
-        "customer.subscription.deleted",
-        "invoice.payment_failed",
-    ):
-        # These events all have a subscription object
-        customer_email = obj.get("customer_email")
-        customer_name = obj.get("customer_name")
+            upsert_training_client(
+                email=email,
+                name=name,
+                price_id=price_id,
+                billing_status=billing_status,
+                source="stripe_subscription",
+            )
 
-        price_id = None
-        items = obj.get("items", {}).get("data", [])
-        if items:
-            price_id = items[0].get("price", {}).get("id")
+        elif event_type == "invoice.payment_failed":
+            customer_id = obj.get("customer")
+            subscription_id = obj.get("subscription")
 
-        billing_status = obj.get("status") or "unknown"
+            email, name = get_customer_email_name(customer_id, obj.get("customer_email"), obj.get("customer_name"))
+            price_id = get_price_id_from_subscription(subscription_id)
 
-        update_training_client_from_stripe(
-            customer_email=customer_email,
-            customer_name=customer_name,
-            price_id=price_id,
-            status=billing_status,
-        )
+            upsert_training_client(
+                email=email,
+                name=name,
+                price_id=price_id,
+                billing_status="past_due",
+                source="stripe_invoice",
+            )
 
-    # Always return 200 so Stripe is happy unless we explicitly error out
-    return {"received": True}
+        else:
+            # Ignore other events
+            pass
+
+        # Mark processed ONLY after successful handling
+        if event_id:
+            mark_event_processed(event_id)
+
+        return {"received": True}
+
+    except JarvasUnavailable as e:
+        log.error("Jarvas unavailable while processing Stripe event: %r", e)
+
+        # If we fail-closed, force Stripe to retry by returning 500
+        if FAIL_CLOSED:
+            raise HTTPException(status_code=503, detail="Memory store unavailable; retry later")
+
+        # If not fail-closed, acknowledge (not recommended)
+        return {"received": True, "warning": "memory store unavailable"}
+
+    except Exception as e:
+        log.exception("Webhook handler error: %r", e)
+        # Return 500 so Stripe retries (safer than silently losing events)
+        raise HTTPException(status_code=500, detail="Webhook handler failed")
