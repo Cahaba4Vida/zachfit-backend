@@ -9,8 +9,9 @@ from typing import Any, Optional, Dict, List, Tuple
 
 import stripe
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
+
 
 # ------------------------------------------------------------
 # Logging
@@ -21,10 +22,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("zachfit-backend")
 
+
 # ------------------------------------------------------------
 # App
 # ------------------------------------------------------------
 app = FastAPI()
+
 
 # ------------------------------------------------------------
 # ENV
@@ -38,13 +41,15 @@ STRIPE_STANDARD_PRICE_ID = os.getenv("STRIPE_STANDARD_PRICE_ID")
 # Jarvas (Redis-backed memory API)
 JARVAS_BASE_URL = os.getenv("JARVAS_BASE_URL", "https://jarvas-memory-api-1.onrender.com").rstrip("/")
 JARVAS_USER_ID = os.getenv("JARVAS_USER_ID", "zach")
-JARVAS_API_KEY = os.getenv("JARVAS_API_KEY")  # should equal MEMORY_API_KEY on Jarvas service
+# Should equal MEMORY_API_KEY used by the Jarvas memory service
+JARVAS_API_KEY = os.getenv("JARVAS_API_KEY")
 
-# Safety mode: if Jarvas is unavailable, we return 500 so Stripe retries.
+# If Jarvas is unavailable during webhook processing, return 503 so Stripe retries
 FAIL_CLOSED = os.getenv("FAIL_CLOSED", "true").lower() in ("1", "true", "yes", "y")
 
 # Wire Stripe SDK
 stripe.api_key = STRIPE_SECRET_KEY
+
 
 # ------------------------------------------------------------
 # Helpers
@@ -82,9 +87,9 @@ def jarvas_headers() -> dict:
 def _maybe_parse_json_string(v: Any) -> Any:
     """
     Jarvas may return:
-      - list/dict (new JSON-safe Jarvas)
+      - list/dict (JSON-safe Jarvas)
       - string "..." (older values)
-    If it's a JSON-looking string, parse it.
+    If it's a JSON-looking string, try to parse it.
     """
     if not isinstance(v, str):
         return v
@@ -93,7 +98,6 @@ def _maybe_parse_json_string(v: Any) -> Any:
     if not s:
         return v
 
-    # quick heuristic
     if s[0] in "[{\"" or s in ("null", "true", "false") or s.replace(".", "", 1).isdigit():
         try:
             return json.loads(s)
@@ -105,7 +109,7 @@ def _maybe_parse_json_string(v: Any) -> Any:
 def jarvas_get_all(user_id: str = JARVAS_USER_ID) -> Dict[str, Any]:
     """
     Returns dict of memory {key: value}.
-    Raises JarvasUnavailable on any error (so we don't accidentally wipe by overwriting with []).
+    Raises JarvasUnavailable on any error (so we don't accidentally wipe data).
     """
     if not JARVAS_API_KEY:
         raise JarvasUnavailable("JARVAS_API_KEY missing")
@@ -119,6 +123,7 @@ def jarvas_get_all(user_id: str = JARVAS_USER_ID) -> Dict[str, Any]:
         )
         r.raise_for_status()
         data = r.json()
+
         out: Dict[str, Any] = {}
         for mem in data.get("memories", []):
             k = mem.get("key")
@@ -126,6 +131,7 @@ def jarvas_get_all(user_id: str = JARVAS_USER_ID) -> Dict[str, Any]:
             if k:
                 out[k] = _maybe_parse_json_string(v)
         return out
+
     except Exception as e:
         raise JarvasUnavailable(f"Jarvas get_memory failed: {e!r}") from e
 
@@ -249,7 +255,6 @@ def already_processed_event(event_id: str) -> bool:
         v = jarvas_get_key(marker_key, default=None)
         return v is not None
     except JarvasUnavailable:
-        # If jarvas is down we *can't* confirm. We'll fail closed later anyway.
         return False
 
 
@@ -327,7 +332,6 @@ def upsert_training_client(
         }
         clients.append(new_client)
 
-    # Save the full list back (Jarvas stores JSON safely)
     jarvas_set_key("training_clients", clients)
 
 
@@ -342,24 +346,50 @@ async def root():
 @app.get("/healthz")
 async def healthz():
     """
-    Health check verifies:
-      - Stripe key configured (not secret validity)
-      - Jarvas reachable (optional, but recommended)
+    SHALLOW health check for Render:
+    - MUST return 200 even if Jarvas is down/rate-limited
+    - SHOULD NOT call external services
+    """
+    return {
+        "ok": True,
+        "time": iso_now(),
+        "stripe_configured": bool(STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET),
+    }
+
+
+@app.get("/readyz")
+async def readyz(response: Response):
+    """
+    DEEP readiness check (does not need to be used by Render):
+    - Checks Jarvas /healthz (no API key, no expensive get_memory)
+    - Reports Stripe config presence
     """
     ok = True
-    details: Dict[str, Any] = {"time": iso_now()}
+    jarvas_status = "ok"
 
-    details["stripe_configured"] = bool(STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET)
-
-    # Jarvas check
-    try:
-        _ = jarvas_get_all()
-        details["jarvas"] = "ok"
-    except Exception as e:
-        details["jarvas"] = f"unavailable: {e!r}"
+    # Stripe config presence
+    stripe_ok = bool(STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET)
+    if not stripe_ok:
         ok = False
 
-    return JSONResponse(status_code=200 if ok else 503, content={"ok": ok, **details})
+    # Jarvas cheap check (prefer /healthz over /get_memory to avoid 429)
+    try:
+        r = requests.get(f"{JARVAS_BASE_URL}/healthz", timeout=5)
+        if not r.ok:
+            ok = False
+            jarvas_status = f"bad_status:{r.status_code}"
+    except Exception as e:
+        ok = False
+        jarvas_status = f"unavailable:{e!r}"
+
+    response.status_code = 200 if ok else 503
+    return {
+        "ok": ok,
+        "time": iso_now(),
+        "stripe_configured": stripe_ok,
+        "jarvas": jarvas_status,
+        "jarvas_base_url": JARVAS_BASE_URL,
+    }
 
 
 @app.post("/stripe-webhook")
@@ -390,16 +420,14 @@ async def stripe_webhook(request: Request):
 
     log.info("Stripe event received: type=%s id=%s", event_type, event_id)
 
-    # Idempotency check (best effort)
+    # Idempotency (best effort)
     try:
         if event_id and already_processed_event(event_id):
             log.info("Stripe event already processed, skipping: %s", event_id)
             return {"received": True, "skipped": True}
     except Exception as e:
         log.warning("Idempotency check failed: %r", e)
-        # continue; fail-closed later if needed
 
-    # Process
     try:
         if event_type == "checkout.session.completed":
             customer_id = obj.get("customer")
@@ -418,7 +446,11 @@ async def stripe_webhook(request: Request):
                 source="stripe_checkout",
             )
 
-        elif event_type in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
+        elif event_type in (
+            "customer.subscription.created",
+            "customer.subscription.updated",
+            "customer.subscription.deleted",
+        ):
             customer_id = obj.get("customer")
             email, name = get_customer_email_name(customer_id, None, None)
 
@@ -452,9 +484,7 @@ async def stripe_webhook(request: Request):
                 source="stripe_invoice",
             )
 
-        else:
-            # Ignore other events
-            pass
+        # ignore other events
 
         # Mark processed ONLY after successful handling
         if event_id:
@@ -464,15 +494,11 @@ async def stripe_webhook(request: Request):
 
     except JarvasUnavailable as e:
         log.error("Jarvas unavailable while processing Stripe event: %r", e)
-
-        # If we fail-closed, force Stripe to retry by returning 500
         if FAIL_CLOSED:
+            # make Stripe retry later
             raise HTTPException(status_code=503, detail="Memory store unavailable; retry later")
-
-        # If not fail-closed, acknowledge (not recommended)
         return {"received": True, "warning": "memory store unavailable"}
 
     except Exception as e:
         log.exception("Webhook handler error: %r", e)
-        # Return 500 so Stripe retries (safer than silently losing events)
         raise HTTPException(status_code=500, detail="Webhook handler failed")
