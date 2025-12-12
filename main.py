@@ -7,6 +7,8 @@ import logging
 from datetime import datetime
 from typing import Any, Optional, Dict, List, Tuple
 
+import re
+
 import stripe
 import requests
 from fastapi import FastAPI, Request, HTTPException, Response
@@ -41,8 +43,8 @@ STRIPE_STANDARD_PRICE_ID = os.getenv("STRIPE_STANDARD_PRICE_ID")
 # Jarvas (Redis-backed memory API)
 JARVAS_BASE_URL = os.getenv("JARVAS_BASE_URL", "https://jarvas-memory-api-1.onrender.com").rstrip("/")
 JARVAS_USER_ID = os.getenv("JARVAS_USER_ID", "zach")
-# Should equal MEMORY_API_KEY used by the Jarvas memory service
-JARVAS_API_KEY = os.getenv("JARVAS_API_KEY")
+# This MUST be the ADMIN key for the Jarvas memory service
+JARVAS_API_KEY = os.getenv("JARVAS_API_KEY") or os.getenv("MEMORY_API_KEY_ADMIN")
 
 # If Jarvas is unavailable during webhook processing, return 503 so Stripe retries
 FAIL_CLOSED = os.getenv("FAIL_CLOSED", "true").lower() in ("1", "true", "yes", "y")
@@ -68,6 +70,23 @@ def slugify_name(name: Optional[str]) -> str:
         .replace("@", "_")
         .replace(".", "_")
     )
+
+
+def normalize_phone(phone: Optional[str]) -> Optional[str]:
+    """
+    Normalize a phone number to 10 digits:
+    - Strip non-digits
+    - Drop leading '1' if 11 digits
+    - Return None if not exactly 10 digits
+    """
+    if not phone:
+        return None
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return None
+    return digits
 
 
 # ------------------------------------------------------------
@@ -170,6 +189,43 @@ def coerce_list_of_dicts(v: Any) -> List[dict]:
     return []
 
 
+def patch_client_meta_for_phone(
+    phone10: str,
+    *,
+    coaching_tier: Optional[str] = None,
+    billing_status: Optional[str] = None,
+    billing: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Upsert client_meta under user_id=f"client:{phone10}" in Jarvas memory.
+
+    - Reads current client_meta (if any)
+    - Applies provided fields (only those that are not None)
+    - Ensures created_at / updated_at
+    """
+    user_id = f"client:{phone10}"
+    store = jarvas_get_all(user_id=user_id)
+    current_meta = store.get("client_meta") or {}
+
+    if not isinstance(current_meta, dict):
+        current_meta = {}
+
+    merged = dict(current_meta)
+
+    if coaching_tier is not None:
+        merged["coaching_tier"] = coaching_tier
+    if billing_status is not None:
+        merged["billing_status"] = billing_status
+    if billing is not None:
+        merged["billing"] = billing
+
+    now = iso_now()
+    merged.setdefault("created_at", now)
+    merged["updated_at"] = now
+
+    jarvas_set_key("client_meta", merged, user_id=user_id)
+
+
 # ------------------------------------------------------------
 # Stripe helpers
 # ------------------------------------------------------------
@@ -264,7 +320,7 @@ def mark_event_processed(event_id: str) -> None:
 
 
 # ------------------------------------------------------------
-# training_clients upsert (no-wipe safe)
+# training_clients upsert (no-wipe safe, email-based roster for Jarvas admin)
 # ------------------------------------------------------------
 def upsert_training_client(
     *,
@@ -429,6 +485,9 @@ async def stripe_webhook(request: Request):
         log.warning("Idempotency check failed: %r", e)
 
     try:
+        # ---------------------------------------------------------------------
+        # checkout.session.completed
+        # ---------------------------------------------------------------------
         if event_type == "checkout.session.completed":
             customer_id = obj.get("customer")
             details = obj.get("customer_details") or {}
@@ -438,6 +497,7 @@ async def stripe_webhook(request: Request):
             email, name = get_customer_email_name(customer_id, fallback_email, fallback_name)
             price_id = get_price_id_from_checkout_session(obj)
 
+            # Maintain email-based training_clients for Jarvas admin
             upsert_training_client(
                 email=email,
                 name=name,
@@ -446,6 +506,34 @@ async def stripe_webhook(request: Request):
                 source="stripe_checkout",
             )
 
+            # Phone-based client_meta for Coach / portal gating
+            raw_phone = (obj.get("metadata") or {}).get("phone") or details.get("phone")
+            phone10 = normalize_phone(raw_phone)
+            if phone10:
+                coaching_tier = infer_tier_from_price(price_id)
+                plan_type = "standard" if coaching_tier == "standard" else (
+                    "lite" if coaching_tier == "ai_only" else "unknown"
+                )
+
+                billing: Dict[str, Any] = {
+                    "stripe_customer_id": customer_id,
+                    "stripe_subscription_id": obj.get("subscription"),
+                    "plan_id": price_id,
+                    "plan_type": plan_type,
+                    "current_period_end": None,  # can be refined from Subscription if needed
+                }
+
+                patch_client_meta_for_phone(
+                    phone10,
+                    coaching_tier=coaching_tier,
+                    billing_status="active",
+                    billing=billing,
+                )
+
+        # ---------------------------------------------------------------------
+        # customer.subscription.* (created/updated/deleted)
+        # Keep training_clients in sync and refine client_meta billing_status
+        # ---------------------------------------------------------------------
         elif event_type in (
             "customer.subscription.created",
             "customer.subscription.updated",
@@ -469,6 +557,40 @@ async def stripe_webhook(request: Request):
                 source="stripe_subscription",
             )
 
+            # Update client_meta if we can resolve phone from subscription metadata
+            raw_phone = (obj.get("metadata") or {}).get("phone")
+            phone10 = normalize_phone(raw_phone)
+            if phone10:
+                coaching_tier = infer_tier_from_price(price_id)
+                plan_type = "standard" if coaching_tier == "standard" else (
+                    "lite" if coaching_tier == "ai_only" else "unknown"
+                )
+
+                current_period_end_iso: Optional[str] = None
+                cpe = obj.get("current_period_end")
+                if cpe:
+                    current_period_end_iso = datetime.utcfromtimestamp(cpe).isoformat() + "Z"
+
+                billing: Dict[str, Any] = {
+                    "stripe_customer_id": customer_id,
+                    "stripe_subscription_id": obj.get("id"),
+                    "plan_id": price_id,
+                    "plan_type": plan_type,
+                    "current_period_end": current_period_end_iso,
+                }
+
+                patch_client_meta_for_phone(
+                    phone10,
+                    coaching_tier=coaching_tier,
+                    billing_status=billing_status,
+                    billing=billing,
+                )
+
+        # ---------------------------------------------------------------------
+        # invoice.payment_failed
+        # Keep roster indicator for email-based training_clients
+        # Subscription.updated will handle client_meta billing_status
+        # ---------------------------------------------------------------------
         elif event_type == "invoice.payment_failed":
             customer_id = obj.get("customer")
             subscription_id = obj.get("subscription")
